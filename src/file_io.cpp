@@ -1,6 +1,7 @@
 #include "file_io.hpp"
 
 #include <cerrno>
+#include <cstddef>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -26,6 +27,7 @@ std::runtime_error system_error(const std::string& action) {
      * 返回：
      * - 返回一个 std::runtime_error，其中包含操作描述和 errno 的可读说明。
      */
+    return std::runtime_error(action + ": " + std::strerror(errno));
 }
 
 }  // namespace
@@ -46,6 +48,35 @@ MappedInputFile::MappedInputFile(const std::string& path) {
      * - 构造函数没有返回值；成功后当前对象表示一个可随机读取的输入文件。
      * - 失败时抛出 std::runtime_error。
      */
+    fd_ = open(path.c_str(), O_RDONLY);
+    if (fd_ < 0) {
+        throw system_error("cannot open input file");
+    }
+
+    struct stat info {};
+    if (fstat(fd_, &info) != 0) {
+        const auto error = system_error("cannot inspect input file");
+        close(fd_);
+        fd_ = -1;
+        throw error;
+    }
+    if (info.st_size < 0) {
+        close(fd_);
+        fd_ = -1;
+        throw std::runtime_error("input file has an invalid size");
+    }
+    size_ = static_cast<std::uint64_t>(info.st_size);
+
+    if (size_ != 0) {
+        void* mapping = mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd_, 0);
+        if (mapping == MAP_FAILED) {
+            const auto error = system_error("cannot mmap input file");
+            close(fd_);
+            fd_ = -1;
+            throw error;
+        }
+        data_ = static_cast<std::uint8_t*>(mapping);
+    }
 }
 
 MappedInputFile::~MappedInputFile() {
@@ -62,6 +93,12 @@ MappedInputFile::~MappedInputFile() {
      * 返回：
      * - 无返回值。
      */
+    if (data_ != nullptr) {
+        munmap(data_, size_);
+    }
+    if (fd_ >= 0) {
+        close(fd_);
+    }
 }
 
 const std::uint8_t* MappedInputFile::data() const {
@@ -77,6 +114,7 @@ const std::uint8_t* MappedInputFile::data() const {
      * - 非空文件返回映射首地址。
      * - 空文件返回 nullptr。
      */
+    return data_;
 }
 
 std::uint64_t MappedInputFile::size() const {
@@ -90,9 +128,12 @@ std::uint64_t MappedInputFile::size() const {
      * 返回：
      * - 返回构造时通过 fstat 获得并保存的 size_；空文件返回 0。
      */
+    return size_;
 }
 
-MappedOutputFile::MappedOutputFile(const std::string& path, std::uint64_t size) {
+MappedOutputFile::MappedOutputFile(const std::string& path, std::uint64_t size) 
+: size_(size) 
+{
     /*
      * 参数：
      * - path：Receiver 要创建或覆盖的目标文件路径。
@@ -110,6 +151,31 @@ MappedOutputFile::MappedOutputFile(const std::string& path, std::uint64_t size) 
      * - 构造函数没有返回值；成功后当前对象可按 chunk offset 写入目标文件。
      * - 失败时抛出 std::runtime_error。
      */
+    if (size > static_cast<std::uint64_t>(std::numeric_limits<off_t>::max())) {
+        throw std::runtime_error("output file is too large for this system");
+    }
+
+    fd_ = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd_ < 0) {
+        throw system_error("cannot create output file");
+    }
+    if (ftruncate(fd_, static_cast<off_t>(size_)) != 0) {
+        const auto error = system_error("cannot resize output file");
+        close(fd_);
+        fd_ = -1;
+        throw error;
+    }
+
+    if (size_ != 0) {
+        void* mapping = mmap(nullptr, size_, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+        if (mapping == MAP_FAILED) {
+            const auto error = system_error("cannot mmap output file");
+            close(fd_);
+            fd_ = -1;
+            throw error;
+        }
+        data_ = static_cast<std::uint8_t*>(mapping);
+    }
 }
 
 MappedOutputFile::~MappedOutputFile() {
@@ -125,6 +191,12 @@ MappedOutputFile::~MappedOutputFile() {
      * 返回：
      * - 无返回值。
      */
+    if (data_ != nullptr) {
+        munmap(data_, size_);
+    }
+    if (fd_ >= 0) {
+        close(fd_);
+    }
 }
 
 std::uint8_t* MappedOutputFile::data() {
@@ -140,6 +212,7 @@ std::uint8_t* MappedOutputFile::data() {
      * - 非空文件返回可写映射首地址。
      * - 空文件返回 nullptr。
      */
+     return data_;
 }
 
 std::uint64_t MappedOutputFile::size() const {
@@ -153,6 +226,7 @@ std::uint64_t MappedOutputFile::size() const {
      * 返回：
      * - 返回构造时保存的 size_；空文件返回 0。
      */
+    return size_;
 }
 
 void MappedOutputFile::sync() {
@@ -169,6 +243,9 @@ void MappedOutputFile::sync() {
      * - 无返回值；正常返回表示刷新操作成功或文件为空。
      * - 失败时抛出 std::runtime_error。
      */
+    if (data_ != nullptr && msync(data_, size_, MS_SYNC) != 0){
+        throw system_error("cannot flush output file");
+    }
 }
 
 }  // namespace frft
