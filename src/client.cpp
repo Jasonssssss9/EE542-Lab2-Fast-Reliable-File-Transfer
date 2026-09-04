@@ -36,107 +36,84 @@ struct Options {
 };
 
 void print_usage(const char* program) {
-    /*
-     * 参数：
-     * - program：argv[0] 提供的客户端程序名称或启动路径。
-     *
-     * 功能：
-     * - 把 client 支持的命令行格式、必填参数和可选参数打印到标准错误流。
-     * - 应说明 --host、--port、--file、--mtu 和 --rate 的使用方式。
-     *
-     * 返回：
-     * - 无返回值。
-     */
+    std::cerr << "Usage: " << program
+              << " --host <server-ip> --port <port> --file <path>"
+                 " [--mtu <bytes>] [--rate <Mbps>]\n";
 }
 
 std::string next_value(int& index, int argc, char* argv[]) {
-    /*
-     * 参数：
-     * - index：当前命令行选项在 argv 中的下标引用；函数需要把它推进到参数值。
-     * - argc：argv 中元素的数量。
-     * - argv：命令行字符串数组。
-     *
-     * 功能：
-     * - 将 index 增加一，定位当前选项之后的 value。
-     * - 检查 value 是否存在，防止读取 argv 范围之外的数据。
-     * - 让外层解析循环跳过已经消费的 value。
-     *
-     * 返回：
-     * - value 存在时返回对应的 std::string。
-     * - 当前选项后没有 value 时抛出 std::invalid_argument。
-     */
+    if (++index >= argc) {
+        throw std::invalid_argument(std::string("missing value after ") + argv[index - 1]);
+    }
+    return argv[index];
 }
 
 Options parse_options(int argc, char* argv[]) {
-    /*
-     * 参数：
-     * - argc：client 的命令行参数数量。
-     * - argv：client 的命令行参数数组。
-     *
-     * 功能：
-     * - 从 argv 解析 --host、--port、--file、--mtu、--rate 和 --help。
-     * - 保留 Options 中定义的默认 MTU 和默认发送速率。
-     * - 验证端口位于 1～65535，速率为有限正数，必填参数均已提供。
-     * - 调用 chunk_size_for_mtu 验证 MTU 能生成合法 FRFT DATA。
-     * - --help 应打印帮助并正常结束程序；未知参数或非法值应报告错误。
-     *
-     * 返回：
-     * - 成功时返回填充并验证完成的 Options。
-     * - 参数缺失、格式错误或数值越界时抛出 std::invalid_argument
-     *   或底层数值转换异常。
-     */
+    Options options;
+    for (int i = 1; i < argc; ++i) {
+        const std::string argument = argv[i];
+        if (argument == "--host") {
+            options.host = next_value(i, argc, argv);
+        } else if (argument == "--port") {
+            const auto value = std::stoul(next_value(i, argc, argv));
+            if (value == 0 || value > 65535) {
+                throw std::invalid_argument("port must be between 1 and 65535");
+            }
+            options.port = static_cast<std::uint16_t>(value);
+        } else if (argument == "--file") {
+            options.file = next_value(i, argc, argv);
+        } else if (argument == "--mtu") {
+            options.mtu = static_cast<std::uint32_t>(std::stoul(next_value(i, argc, argv)));
+        } else if (argument == "--rate") {
+            options.rate_mbps = std::stod(next_value(i, argc, argv));
+        } else if (argument == "--help") {
+            print_usage(argv[0]);
+            std::exit(0);
+        } else {
+            throw std::invalid_argument("unknown argument: " + argument);
+        }
+    }
+
+    if (options.host.empty() || options.file.empty() || options.port == 0) {
+        throw std::invalid_argument("--host, --port, and --file are required");
+    }
+    if (!std::isfinite(options.rate_mbps) || options.rate_mbps <= 0.0) {
+        throw std::invalid_argument("rate must be greater than zero");
+    }
+    frft::chunk_size_for_mtu(options.mtu);
+    return options;
 }
 
 sockaddr_in resolve_server(const Options& options) {
-    /*
-     * 参数：
-     * - options：已经通过验证的客户端配置；使用其中的 host 和 port。
-     *
-     * 功能：
-     * - 使用 getaddrinfo 把 IPv4 主机名或地址和 UDP 端口解析成 sockaddr_in。
-     * - 限制地址族为 AF_INET，socket 类型为 SOCK_DGRAM。
-     * - 复制选中的地址并释放 getaddrinfo 返回的链表。
-     *
-     * 返回：
-     * - 成功时返回可传给 sendto() 的服务器 sockaddr_in。
-     * - 名称或地址解析失败时抛出 std::runtime_error。
-     */
+    addrinfo hints {};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+
+    addrinfo* result = nullptr;
+    const std::string port = std::to_string(options.port);
+    const int status = getaddrinfo(options.host.c_str(), port.c_str(), &hints, &result);
+    if (status != 0) {
+        throw std::runtime_error(std::string("cannot resolve server: ") + gai_strerror(status));
+    }
+
+    sockaddr_in address = *reinterpret_cast<sockaddr_in*>(result->ai_addr);
+    freeaddrinfo(result);
+    return address;
 }
 
-bool same_endpoint(const sockaddr_in& left,
-                   const sockaddr_in& right) {
-    /*
-     * 参数：
-     * - left：第一个 IPv4 UDP endpoint。
-     * - right：第二个 IPv4 UDP endpoint。
-     *
-     * 功能：
-     * - 比较双方的地址族、网络字节序端口和 IPv4 地址。
-     * - 用于过滤来自非预期服务器的 UDP 报文。
-     *
-     * 返回：
-     * - 三项全部相同时返回 true，否则返回 false。
-     */
+bool same_endpoint(const sockaddr_in& left, const sockaddr_in& right) {
+    return left.sin_family == right.sin_family && left.sin_port == right.sin_port &&
+           left.sin_addr.s_addr == right.sin_addr.s_addr;
 }
 
 frft::PacketHeader make_header(frft::PacketType type,
                                std::uint32_t session_id,
                                std::uint32_t number) {
-    /*
-     * 参数：
-     * - type：要创建的 FRFT 报文类型。
-     * - session_id：当前传输会话 ID。
-     * - number：由 type 决定含义的数值，例如 DATA 的 chunk ID。
-     *
-     * 功能：
-     * - 创建 PacketHeader，并保留该结构在头文件中提供的 magic、version、
-     *   header length、flags 和 crc32c 默认值。
-     * - 设置 type、session_id 和 number。
-     * - payload_length 在最终序列化时由实际 payload 大小确定。
-     *
-     * 返回：
-     * - 返回填充基础字段后的 PacketHeader。
-     */
+    frft::PacketHeader header;
+    header.type = type;
+    header.session_id = session_id;
+    header.number = number;
+    return header;
 }
 
 void send_packet(int socket_fd,
@@ -144,24 +121,20 @@ void send_packet(int socket_fd,
                  const frft::PacketHeader& header,
                  const std::uint8_t* payload,
                  std::size_t payload_size) {
-    /*
-     * 参数：
-     * - socket_fd：已创建的客户端 UDP socket 文件描述符。
-     * - server：目标服务器的 IPv4 地址和 UDP 端口。
-     * - header：当前 FRFT 报文的逻辑 Header。
-     * - payload：类型专用 payload 或 DATA 文件内容；长度为 0 时可为 nullptr。
-     * - payload_size：payload 的实际字节数。
-     *
-     * 功能：
-     * - 调用 serialize_packet 构造完整 UDP payload。
-     * - 使用 sendto 把 datagram 发送到 server。
-     * - 系统调用被信号以 EINTR 中断时重新尝试。
-     * - 验证返回的发送字节数与 datagram 大小一致。
-     *
-     * 返回：
-     * - 无返回值；正常返回表示 datagram 已成功交给本机 UDP/IP 栈。
-     * - 序列化失败、sendto 失败或发送长度异常时抛出异常。
-     */
+    const auto datagram = frft::serialize_packet(header, payload, payload_size);
+    ssize_t sent;
+    do {
+        sent = sendto(socket_fd,
+                      datagram.data(),
+                      datagram.size(),
+                      0,
+                      reinterpret_cast<const sockaddr*>(&server),
+                      sizeof(server));
+    } while (sent < 0 && errno == EINTR);
+
+    if (sent < 0 || static_cast<std::size_t>(sent) != datagram.size()) {
+        throw std::runtime_error(std::string("sendto failed: ") + std::strerror(errno));
+    }
 }
 
 bool receive_expected(int socket_fd,
@@ -170,147 +143,272 @@ bool receive_expected(int socket_fd,
                       std::uint32_t session_id,
                       int timeout_ms,
                       frft::Packet& result) {
-    /*
-     * 参数：
-     * - socket_fd：用于接收服务器响应的客户端 UDP socket。
-     * - server：唯一允许作为响应来源的服务器 endpoint。
-     * - expected_type：调用者当前等待的 FRFT 报文类型。
-     * - session_id：当前会话 ID。
-     * - timeout_ms：本次等待允许持续的总毫秒数。
-     * - result：成功时用于保存完整解析报文的输出参数。
-     *
-     * 功能：
-     * - 使用 steady_clock 计算绝对截止时间，并通过 poll 等待 socket 可读。
-     * - recvfrom 被 EINTR 中断时继续等待，但不能重新开始整个 timeout。
-     * - 过滤来源错误、无法解析、session 不同或 type 不符的 datagram。
-     * - 在截止时间前持续寻找满足所有条件的目标报文。
-     *
-     * 返回：
-     * - 截止时间前收到目标报文时，把它移动到 result 并返回 true。
-     * - 等待超时时返回 false。
-     * - poll 或 recvfrom 出现不可恢复的系统错误时抛出 std::runtime_error。
-     */
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeout_ms);
+    std::vector<std::uint8_t> buffer(65535);
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+        pollfd descriptor {socket_fd, POLLIN, 0};
+        const int ready = poll(&descriptor, 1, std::max(1, static_cast<int>(remaining.count())));
+        if (ready == 0) {
+            return false;
+        }
+        if (ready < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            throw std::runtime_error(std::string("poll failed: ") + std::strerror(errno));
+        }
+
+        sockaddr_in source {};
+        socklen_t source_length = sizeof(source);
+        const ssize_t received = recvfrom(socket_fd,
+                                          buffer.data(),
+                                          buffer.size(),
+                                          0,
+                                          reinterpret_cast<sockaddr*>(&source),
+                                          &source_length);
+        if (received < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            throw std::runtime_error(std::string("recvfrom failed: ") + std::strerror(errno));
+        }
+
+        frft::Packet packet;
+        std::string error;
+        if (!same_endpoint(source, server) ||
+            !frft::deserialize_packet(buffer.data(), received, packet, error) ||
+            packet.header.session_id != session_id || packet.header.type != expected_type) {
+            continue;
+        }
+        result = std::move(packet);
+        return true;
+    }
+    return false;
 }
 
-void apply_ack_packet(const frft::Packet& packet,
-                      frft::SenderWindow& window) {
-    /*
-     * 参数：
-     * - packet：已经完成通用 Header 验证、类型为 ACK 的 FRFT 报文。
-     * - window：要根据 ACK 更新的客户端发送窗口。
-     *
-     * 功能：
-     * - 解析 ACK payload。
-     * - 当前 Stage 1 只接受 bitmap_bits 为 0 的累计 ACK。
-     * - 合法时将 cumulative_ack 应用到 SenderWindow。
-     * - 无效 ACK 或尚未支持的 SACK ACK 应被忽略，不改变窗口。
-     *
-     * 返回：
-     * - 无返回值；窗口更新通过 window 引用产生。
-     */
+void apply_ack_packet(const frft::Packet& packet, frft::SenderWindow& window) {
+    frft::AckPayload ack;
+    if (!frft::deserialize_ack(packet.payload, ack) || ack.bitmap_bits != 0) {
+        return;
+    }
+    window.apply_cumulative_ack(ack.cumulative_ack);
 }
 
 void drain_acks(int socket_fd,
                 const sockaddr_in& server,
                 std::uint32_t session_id,
                 frft::SenderWindow& window) {
-    /*
-     * 参数：
-     * - socket_fd：客户端 UDP socket。
-     * - server：预期 ACK 来源 endpoint。
-     * - session_id：当前会话 ID。
-     * - window：需要应用累计 ACK 的发送窗口。
-     *
-     * 功能：
-     * - 使用 MSG_DONTWAIT 连续读取当前已排队的 UDP datagram。
-     * - 过滤来源、解析、session 和 PacketType，只处理当前会话的 ACK。
-     * - 对每个合法 ACK 调用 apply_ack_packet。
-     * - socket 暂时无更多数据时立即返回，不能阻塞 DATA 发送循环。
-     * - EINTR 时继续接收，其他 recvfrom 错误应抛出异常。
-     *
-     * 返回：
-     * - 无返回值；所有可用 ACK 被处理后返回。
-     */
+    std::vector<std::uint8_t> buffer(65535);
+    while (true) {
+        sockaddr_in source {};
+        socklen_t source_length = sizeof(source);
+        const ssize_t received = recvfrom(socket_fd,
+                                          buffer.data(),
+                                          buffer.size(),
+                                          MSG_DONTWAIT,
+                                          reinterpret_cast<sockaddr*>(&source),
+                                          &source_length);
+        if (received < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                return;
+            }
+            throw std::runtime_error(std::string("recvfrom failed: ") + std::strerror(errno));
+        }
+
+        frft::Packet packet;
+        std::string error;
+        if (same_endpoint(source, server) &&
+            frft::deserialize_packet(buffer.data(), received, packet, error) &&
+            packet.header.session_id == session_id && packet.header.type == frft::PacketType::ACK) {
+            apply_ack_packet(packet, window);
+        }
+    }
 }
 
 void wait_for_ack(int socket_fd,
                   const sockaddr_in& server,
                   std::uint32_t session_id,
                   frft::SenderWindow& window) {
-    /*
-     * 参数：
-     * - socket_fd：客户端 UDP socket。
-     * - server：预期 ACK 来源。
-     * - session_id：当前会话 ID。
-     * - window：收到 ACK 后需要推进的 SenderWindow。
-     *
-     * 功能：
-     * - 当发送窗口已满时，阻塞等待当前会话的一个 ACK。
-     * - 使用 Stage 1 的有限等待时间，避免零丢包版本永久卡住。
-     * - 收到合法 ACK 后调用 apply_ack_packet 更新窗口。
-     *
-     * 返回：
-     * - 无返回值。
-     * - 超时未收到累计 ACK 时抛出 std::runtime_error，说明 Stage 1
-     *   需要零丢包环境；底层接收错误也继续向上抛出。
-     */
+    frft::Packet packet;
+    if (!receive_expected(socket_fd, server, frft::PacketType::ACK, session_id, 5000, packet)) {
+        throw std::runtime_error(
+            "no cumulative ACK received; Stage 1 requires a zero-loss network");
+    }
+    apply_ack_packet(packet, window);
 }
 
 std::uint32_t random_session_id() {
-    /*
-     * 参数：
-     * - 无显式参数。
-     *
-     * 功能：
-     * - 使用系统提供的随机源生成 32-bit session ID。
-     * - 如果结果为 0，则继续生成，因为协议规定 session ID 必须非零。
-     *
-     * 返回：
-     * - 返回一个非零的随机 uint32_t 会话标识。
-     */
+    std::random_device random;
+    std::uint32_t session_id = 0;
+    while (session_id == 0) {
+        session_id = (static_cast<std::uint32_t>(random()) << 16) ^ random();
+    }
+    return session_id;
 }
 
 int run_client(const Options& options) {
-    /*
-     * 参数：
-     * - options：已经解析和验证的客户端配置，包括服务器地址、端口、源文件、
-     *   MTU 和目标发送速率。
-     *
-     * 功能：
-     * - 打开并 mmap 源文件，计算 chunk_size、total_chunks 和默认窗口 chunk 数。
-     * - 验证默认 8 MiB 窗口能够被配置的 ACK bitmap 覆盖。
-     * - 解析服务器地址、创建 UDP socket，并启用禁止 IPv4 分片的 PMTU 检查。
-     * - 生成 session ID，构造 START payload，并按控制超时和次数重试 START 握手。
-     * - 验证 START_ACK 状态及服务器接受的窗口/bitmap 参数。
-     * - 创建 SenderWindow 和共享 DATA Pacer。
-     * - 在滑动窗口允许时按 chunk ID 计算文件 offset 和 payload 长度，
-     *   经过 pacer 后发送 DATA，并处理当前可用累计 ACK。
-     * - 窗口已满时等待 ACK；当前 Stage 1 不执行 DATA 重传。
-     * - 所有 chunk 获得累计确认后，重试 COMPLETE 直到收到合法 COMPLETE_ACK。
-     * - 验证 Receiver 返回的 chunk 数和文件字节数，计算并打印传输统计。
-     * - 无论正常结束还是发生异常，都要关闭 UDP socket；其他 RAII 对象负责文件清理。
-     *
-     * 返回：
-     * - 传输完整成功并通过最终统计检查时返回 0。
-     * - 运行错误通过异常报告给 main，本函数不返回失败状态码。
-     */
+    frft::MappedInputFile input(options.file);
+    const std::uint32_t chunk_size = frft::chunk_size_for_mtu(options.mtu);
+    const std::uint32_t total_chunks = frft::chunk_count(input.size(), chunk_size);
+    const std::uint32_t window_chunks = static_cast<std::uint32_t>(
+        (frft::kDefaultWindowBytes + chunk_size - 1) / chunk_size);
+    if (window_chunks > frft::kDefaultAckBitmapBits) {
+        throw std::runtime_error("configured MTU makes the default window exceed ACK coverage");
+    }
+
+    const sockaddr_in server = resolve_server(options);
+    const int socket_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (socket_fd < 0) {
+        throw std::runtime_error(std::string("socket failed: ") + std::strerror(errno));
+    }
+
+    try {
+        const int discover = IP_PMTUDISC_DO;
+        if (setsockopt(socket_fd, IPPROTO_IP, IP_MTU_DISCOVER, &discover, sizeof(discover)) != 0) {
+            throw std::runtime_error(std::string("cannot enable path-MTU checks: ") +
+                                     std::strerror(errno));
+        }
+
+        const std::uint32_t session_id = random_session_id();
+        const frft::StartPayload start {
+            input.size(),
+            chunk_size,
+            total_chunks,
+            window_chunks,
+            frft::kDefaultAckBitmapBits,
+            frft::kDefaultAckIntervalMs,
+        };
+        const auto start_payload = frft::serialize_start(start);
+        const auto start_header = make_header(frft::PacketType::START, session_id, 0);
+
+        frft::StartAckPayload accepted;
+        bool started = false;
+        for (int attempt = 0; attempt < frft::kControlAttempts && !started; ++attempt) {
+            send_packet(socket_fd,
+                        server,
+                        start_header,
+                        start_payload.data(),
+                        start_payload.size());
+            frft::Packet response;
+            if (!receive_expected(socket_fd,
+                                  server,
+                                  frft::PacketType::START_ACK,
+                                  session_id,
+                                  frft::kControlTimeoutMs,
+                                  response)) {
+                continue;
+            }
+            if (!frft::deserialize_start_ack(response.payload, accepted)) {
+                throw std::runtime_error("server returned an invalid START_ACK");
+            }
+            if (accepted.status != frft::StatusCode::OK) {
+                throw std::runtime_error("server rejected the transfer");
+            }
+            started = true;
+        }
+        if (!started) {
+            throw std::runtime_error("START handshake timed out after 10 attempts");
+        }
+        if (accepted.accepted_window_chunks == 0 ||
+            accepted.accepted_window_chunks > accepted.accepted_bitmap_bits) {
+            throw std::runtime_error("server accepted an invalid sliding window");
+        }
+
+        frft::SenderWindow window(total_chunks, accepted.accepted_window_chunks);
+        const auto rate_bps = static_cast<std::uint64_t>(options.rate_mbps * 1'000'000.0);
+        frft::Pacer pacer(rate_bps);
+        std::uint64_t sent_data_packets = 0;
+        bool sent_first_data = false;
+        std::chrono::steady_clock::time_point first_data_time;
+
+        while (!window.all_acked()) {
+            if (!window.can_send()) {
+                wait_for_ack(socket_fd, server, session_id, window);
+                continue;
+            }
+
+            const std::uint32_t sequence = window.take_next_sequence();
+            const std::uint64_t offset = static_cast<std::uint64_t>(sequence) * chunk_size;
+            const std::size_t payload_size = static_cast<std::size_t>(
+                std::min<std::uint64_t>(chunk_size, input.size() - offset));
+            const auto header = make_header(frft::PacketType::DATA, session_id, sequence);
+
+            pacer.wait_for_slot(frft::kIpv4UdpOverhead + frft::kHeaderSize + payload_size);
+            if (!sent_first_data) {
+                first_data_time = std::chrono::steady_clock::now();
+                sent_first_data = true;
+            }
+            send_packet(socket_fd, server, header, input.data() + offset, payload_size);
+            ++sent_data_packets;
+            drain_acks(socket_fd, server, session_id, window);
+        }
+
+        const auto complete_header =
+            make_header(frft::PacketType::COMPLETE, session_id, total_chunks);
+        frft::CompleteAckPayload completed;
+        bool finished = false;
+        for (int attempt = 0; attempt < frft::kControlAttempts && !finished; ++attempt) {
+            send_packet(socket_fd, server, complete_header, nullptr, 0);
+            frft::Packet response;
+            if (!receive_expected(socket_fd,
+                                  server,
+                                  frft::PacketType::COMPLETE_ACK,
+                                  session_id,
+                                  frft::kControlTimeoutMs,
+                                  response)) {
+                continue;
+            }
+            if (!frft::deserialize_complete_ack(response.payload, completed)) {
+                throw std::runtime_error("server returned an invalid COMPLETE_ACK");
+            }
+            finished = completed.status == frft::StatusCode::OK;
+        }
+        if (!finished) {
+            throw std::runtime_error("COMPLETE handshake timed out after 10 attempts");
+        }
+        if (completed.received_chunks != total_chunks || completed.received_bytes != input.size()) {
+            throw std::runtime_error("server completion statistics do not match the input file");
+        }
+
+        const auto end_time = std::chrono::steady_clock::now();
+        const double elapsed_seconds = sent_first_data
+                                           ? std::chrono::duration<double>(end_time - first_data_time)
+                                                 .count()
+                                           : 0.0;
+        const double throughput_mbps =
+            elapsed_seconds > 0.0 ? input.size() * 8.0 / elapsed_seconds / 1'000'000.0 : 0.0;
+
+        std::cout << "Transfer complete\n"
+                  << "  session: " << session_id << '\n'
+                  << "  file bytes: " << input.size() << '\n'
+                  << "  DATA packets: " << sent_data_packets << '\n'
+                  << "  elapsed seconds: " << elapsed_seconds << '\n'
+                  << "  client throughput Mbps: " << throughput_mbps << '\n'
+                  << "  receiver data time us: " << completed.receiver_transfer_time_us << '\n';
+
+        close(socket_fd);
+        return 0;
+    } catch (...) {
+        close(socket_fd);
+        throw;
+    }
 }
 
 }  // namespace
 
 int main(int argc, char* argv[]) {
-    /*
-     * 参数：
-     * - argc：client 命令行参数数量。
-     * - argv：client 命令行参数数组，其中 argv[0] 是程序名称。
-     *
-     * 功能：
-     * - 调用 parse_options 解析参数，再调用 run_client 执行一次文件传输。
-     * - 捕获 std::exception，打印带 client 前缀的错误和命令行帮助。
-     * - 不允许异常越过程序入口。
-     *
-     * 返回：
-     * - 传输成功时返回 run_client 的 0。
-     * - 参数或运行过程失败时返回 1。
-     */
+    try {
+        return run_client(parse_options(argc, argv));
+    } catch (const std::exception& error) {
+        std::cerr << "client: " << error.what() << '\n';
+        print_usage(argv[0]);
+        return 1;
+    }
 }
