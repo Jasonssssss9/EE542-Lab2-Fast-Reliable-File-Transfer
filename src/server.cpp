@@ -393,6 +393,7 @@ int run_server(const Options& options) {
      * - 一次文件传输和结束握手成功完成时返回 0。
      * - 运行失败时抛出异常，由 main 转换为非零退出码。
      */
+     const int socket_fd = socket(AF_INET, SOCK_DGRAM, 0);
      if (socket_fd < 0) {
           throw std::runtime_error(std::string("socket failed: ") + std::strerror(errno));
      }
