@@ -261,7 +261,8 @@ void send_ack(int socket_fd,
               const sockaddr_in& client,
               std::uint32_t session_id,
               std::uint32_t ack_number,
-              const frft::ReceiverTracker& tracker) {
+              const frft::ReceiverTracker& tracker,
+              std::uint16_t bitmap_bits) {
     /*
      * 参数：
      * - socket_fd：服务器 UDP socket。
