@@ -203,8 +203,9 @@ void apply_ack_packet(const frft::Packet& packet, frft::SenderWindow& window) {
 void drain_acks(int socket_fd,
                 const sockaddr_in& server,
                 std::uint32_t session_id,
-                frft::SenderWindow& window) {
-    std::vector<std::uint8_t> buffer(65535);
+                frft::SenderWindow& window,
+                std::vector<std::uint8_t>& buffer) {
+    //std::vector<std::uint8_t> buffer(65535);
     while (true) {
         sockaddr_in source {};
         socklen_t source_length = sizeof(source);
@@ -254,6 +255,7 @@ std::uint32_t random_session_id() {
 }
 
 int run_client(const Options& options) {
+    std::vector<std::uint8_t> receive_buffer(65535);
     frft::MappedInputFile input(options.file);
     const std::uint32_t chunk_size = frft::chunk_size_for_mtu(options.mtu);
     const std::uint32_t total_chunks = frft::chunk_count(input.size(), chunk_size);
@@ -331,7 +333,7 @@ int run_client(const Options& options) {
         std::chrono::steady_clock::time_point first_data_time;
 
         while (!window.all_acked()) {
-            drain_acks(socket_fd, server, session_id, window);
+            drain_acks(socket_fd, server, session_id, window, receive_buffer);
             window.check_timeouts(std::chrono::steady_clock::now(),
                                   std::chrono::milliseconds(frft::kDefaultRtoMs));
 
@@ -361,7 +363,7 @@ int run_client(const Options& options) {
             if (decision->retransmission) {
                 ++retransmitted_packets;
             }
-            drain_acks(socket_fd, server, session_id, window);
+            drain_acks(socket_fd, server, session_id, window, receive_buffer);
         }
 
         const auto complete_header =
