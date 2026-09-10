@@ -1,4 +1,4 @@
-# EE542-Lab2-Reliable-File-Transfer
+# EE542-Lab2-Fast-Reliable-File-Transfer
 
 EE542 Lab 2 project for a fast, reliable file-transfer protocol over IP. This is a small
 three-day C++ lab, and GNU Make is the only build system.
